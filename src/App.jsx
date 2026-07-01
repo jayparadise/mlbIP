@@ -27,13 +27,20 @@ function nbLogPmf(k, r, p) {
 function countCdf(mean, variance, kmax = 60) {
   const pmf = new Array(kmax + 1).fill(0);
   if (mean <= 1e-9) { pmf[0] = 1; }
-  else if (variance <= mean * 1.05) {           // Poisson
-    pmf[0] = Math.exp(-mean);
-    for (let k = 1; k <= kmax; k++) pmf[k] = pmf[k - 1] * mean / k;
-  } else {                                        // Negative Binomial
+  else if (variance > mean * 1.05) {            // Negative Binomial (overdispersed)
     const v = Math.max(variance, mean * 1.0000001);
     const p = mean / v, r = (mean * mean) / (v - mean);
     for (let k = 0; k <= kmax; k++) pmf[k] = Math.exp(nbLogPmf(k, r, p));
+  } else if (variance < mean * 0.95) {          // Binomial (underdispersed)
+    let p = 1 - variance / mean;
+    p = Math.min(Math.max(p, 1e-3), 0.999);
+    let n = Math.max(1, Math.round(mean / p));
+    p = mean / n;                               // preserve the mean exactly
+    for (let k = 0; k <= Math.min(n, kmax); k++)
+      pmf[k] = Math.exp(logGamma(n + 1) - logGamma(k + 1) - logGamma(n - k + 1) + k * Math.log(p) + (n - k) * Math.log(1 - p));
+  } else {                                        // Poisson
+    pmf[0] = Math.exp(-mean);
+    for (let k = 1; k <= kmax; k++) pmf[k] = pmf[k - 1] * mean / k;
   }
   let tot = pmf.reduce((a, b) => a + b, 0);
   const cdf = []; let run = 0;
@@ -169,20 +176,6 @@ function anchor( our, comp, weight, maxDev) {
   return Math.max(comp - maxDev, Math.min(comp + maxDev, blended));
 }
 
-// ---------- sample players (from the pre-game screenshots) ----------
-const HITTERS = {
-  "Paul Goldschmidt": { hits: 1.5, tb: 2.2, hr: 0.2, team: "NYY" },
-  "Ben Rice":         { hits: 1.5, tb: 4.5, hr: 0.4, team: "NYY" },
-  "Riley Greene":     { hits: 1.25, tb: 2.5, hr: 0.25, team: "DET" },
-  "Cody Bellinger":   { hits: 1.5, tb: 2.5, hr: 0.25, team: "NYY" },
-  "Jazz Chisholm Jr.":{ hits: 1.22, tb: 3.0, hr: 0.3, team: "NYY" },
-  "Kerry Carpenter":  { hits: 1.11, tb: 3.0, hr: 0.3, team: "DET" },
-};
-const PITCHERS = {
-  "Will Warren":  { k: 6.14, ha: 5.5, team: "NYY", limit: 95 },
-  "Troy Melton":  { k: 5.01, ha: 5.91, team: "DET", limit: 90 },
-};
-
 // ============================================================================
 //  UI
 // ============================================================================
@@ -216,6 +209,16 @@ function Stepper({ value, set, min = 0, max = 99, step = 1 }) {
 }
 const stepBtn = { background: C.panel, border: "none", color: C.dim, width: 30, cursor: "pointer", fontSize: 16, fontFamily: C.mono };
 
+// compact decimal-safe text input (raw string, sanitized on change)
+function MiniInput({ value, onChange }) {
+  return (
+    <input value={value ?? ""} inputMode="decimal" placeholder="—"
+      onChange={(e) => { const v = e.target.value; if (v === "" || /^\d*\.?\d*$/.test(v)) onChange(v); }}
+      style={{ background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 4, color: C.ink,
+        fontFamily: C.mono, fontSize: 12, padding: "6px 4px", width: "100%", boxSizing: "border-box", textAlign: "center" }} />
+  );
+}
+
 function Toggle({ on, set, labels = ["OFF", "ON"] }) {
   return (
     <div style={{ display: "flex", border: `1px solid ${C.line}`, borderRadius: 5, overflow: "hidden", fontFamily: C.mono, fontSize: 12 }}>
@@ -231,8 +234,9 @@ function Toggle({ on, set, labels = ["OFF", "ON"] }) {
 
 // price cell: our fair/price, editable comp, anchored our-price
 function PriceRow({ row, suspended, setComp }) {
-  const { label, ourFair, ourPrice, compKey, compPrice, anchoredPrice } = row;
-  const deviates = compPrice && anchoredPrice && Math.abs(anchoredPrice - compPrice) / compPrice > 0.08;
+  const { label, ourFair, ourPrice, compKey, compRaw, anchoredPrice } = row;
+  const compNum = parseFloat(compRaw);
+  const deviates = !isNaN(compNum) && anchoredPrice && Math.abs(anchoredPrice - compNum) / compNum > 0.08;
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1.15fr 1.1fr 0.9fr 0.9fr", alignItems: "center",
       padding: "7px 12px", borderBottom: `1px solid ${C.line}`, fontFamily: C.mono, fontSize: 13,
@@ -243,7 +247,7 @@ function PriceRow({ row, suspended, setComp }) {
         <span style={{ color: C.ink, marginLeft: 8, fontSize: 13 }}>{suspended ? "SUSP" : (ourPrice ?? "—")}</span>
       </span>
       <input
-        value={compPrice ?? ""} placeholder="—"
+        value={compRaw ?? ""} placeholder="—" inputMode="decimal"
         onChange={(e) => setComp(compKey, e.target.value)}
         style={{ background: "transparent", border: `1px solid ${C.line}`, borderRadius: 4,
           color: C.comp, fontFamily: C.mono, fontSize: 12.5, width: 54, padding: "3px 5px", textAlign: "center" }} />
@@ -255,12 +259,15 @@ function PriceRow({ row, suspended, setComp }) {
   );
 }
 
-function MarketCard({ title, rows, suspended, note }) {
+function MarketCard({ title, line, rows, suspended, note }) {
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
         padding: "10px 12px", borderBottom: `1px solid ${C.line}`, background: C.panel2 }}>
-        <span style={{ fontFamily: C.mono, fontSize: 12, letterSpacing: 0.5, color: C.ink, textTransform: "uppercase" }}>{title}</span>
+        <span style={{ fontFamily: C.mono, fontSize: 12, letterSpacing: 0.5, color: C.ink, textTransform: "uppercase" }}>
+          {title}
+          {line != null && <span style={{ color: C.accent, marginLeft: 8 }}>O/U {line}</span>}
+        </span>
         {suspended && <span style={{ fontFamily: C.mono, fontSize: 10, color: C.warn, border: `1px solid ${C.warn}`, padding: "2px 6px", borderRadius: 4 }}>SUSPENDED</span>}
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1.15fr 1.1fr 0.9fr 0.9fr", padding: "6px 12px",
@@ -275,8 +282,24 @@ function MarketCard({ title, rows, suspended, note }) {
 
 export default function App() {
   const [kind, setKind] = useState("hitter");
-  const [hitterName, setHitterName] = useState("Paul Goldschmidt");
-  const [pitcherName, setPitcherName] = useState("Will Warren");
+
+  // ---- editable player inputs (type any player; no dropdown) ----
+  // projections (means) and std devs are RAW STRINGS so decimals type freely
+  const [proj, setProj] = useState({ hits: "1.5", tb: "2.2", hr: "0.2", k: "6.14", ha: "5.5" });
+  const [std, setStd]   = useState({ hits: "0.9", tb: "1.67", hr: "0.5", k: "2.4", ha: "2.0" });
+  // pre-game book O/U line + prices (served verbatim until first event)
+  const [book, setBook] = useState({
+    hits_line: "1.5", hits_over: "1.43", hits_under: "2.74",
+    tb_line: "1.5", tb_over: "1.95", tb_under: "1.80",
+    hr1: "5.00",
+    k_line: "6.5", k_over: "", k_under: "",
+    ha_line: "5.5", ha_over: "", ha_under: "",
+  });
+  const hookLimit = 95;
+  const setPr = (k, v) => { if (v === "" || /^\d*\.?\d*$/.test(v)) setProj((p) => ({ ...p, [k]: v })); };
+  const setSd = (k, v) => { if (v === "" || /^\d*\.?\d*$/.test(v)) setStd((p) => ({ ...p, [k]: v })); };
+  const setBk = (k, v) => { if (v === "" || /^\d*\.?\d*$/.test(v)) setBook((p) => ({ ...p, [k]: v })); };
+  const fnum = (obj, k, def = 0) => { const v = parseFloat(obj[k]); return isNaN(v) ? def : v; };
 
   // game state
   const [inning, setInning] = useState(6);
@@ -312,86 +335,131 @@ export default function App() {
   const [useComps, setUseComps] = useState(true);
   const [weight, setWeight] = useState(0.5);
   const [maxDev, setMaxDev] = useState(0.06);
-  // comp inputs keyed by market id: {over, under} decimal prices
+  // comp inputs are RAW STRINGS (so decimals type naturally). Keys are stable
+  // per-market ids; the O/U line is chosen dynamically so its comp key is not
+  // tied to a specific line number.
   const [comps, setComps] = useState({
-    hits15_over: 2.2, hits15_under: 1.67,
-    tb15_over: 1.95, tb15_under: 1.8,
-    hr1: 5.0,
-    k65_over: 2.1, k65_under: 1.72,
-    ha55_over: 1.9, ha55_under: 1.9,
+    hits_ou_over: "2.20", hits_ou_under: "1.67",
+    tb_ou_over: "1.95", tb_ou_under: "1.80",
+    hr_m1: "5.00",
+    k_ou_over: "2.10", k_ou_under: "1.72",
+    ha_ou_over: "1.90", ha_ou_under: "1.90",
   });
-  const setComp = (k, v) => setComps((c) => ({ ...c, [k]: v === "" ? null : parseFloat(v) }));
+  // accept only empty / digits / a single decimal point while typing
+  const setComp = (k, v) => {
+    if (v === "" || /^\d*\.?\d*$/.test(v)) setComps((c) => ({ ...c, [k]: v }));
+  };
+  const num = (k) => {
+    const v = parseFloat(comps[k]);
+    return isNaN(v) ? null : v;
+  };
 
   const gs = { inning, top, outs, awayScore, homeScore, awayDueUp: dueUp - 1, homeDueUp: dueUp - 1 };
+  const pregameActive = !firstEvent;
 
   const result = useMemo(() => {
-    // helper to build a two-way OU row
-    const ouRow = (label, cdf, locked, line, compKey) => {
+    // overdispersion factor phi so the model's full-game variance matches the
+    // std dev you entered. computed at t=0 (fresh game) and applied to the live
+    // remaining variance, so your std dev genuinely shapes the distribution.
+    const phiFor = (userStd, modelFullVar) => {
+      if (!userStd || userStd <= 0) return 1;
+      const f = (userStd * userStd) / Math.max(modelFullVar, 1e-6);
+      return Math.min(8, Math.max(0.3, f));
+    };
+    // choose the O/U line from a ladder so the price stays near even money.
+    const pickBalancedLine = (cdf, locked, ladder) => {
+      let best = ladder[0], bestDiff = Infinity;
+      for (const L of ladder) {
+        const diff = Math.abs(pOver(cdf, locked, L) - 0.5);
+        if (diff < bestDiff) { bestDiff = diff; best = L; }
+      }
+      return best;
+    };
+    // main two-way O/U at the auto-selected line. In pre-game mode we serve the
+    // book O/U line + prices you entered, verbatim, until the first event.
+    const ouMain = (cdf, locked, ladder, prefix, bookLineKey, bookOverKey, bookUnderKey) => {
+      const line = pickBalancedLine(cdf, locked, ladder);
       const fo = pOver(cdf, locked, line);
       const fu = 1 - fo;
-      const [cofair, cufair] = useComps ? devig(comps[compKey + "_over"], comps[compKey + "_under"]) : [null, null];
-      const aOver = anchor(fo, useComps ? cofair : null, weight, maxDev);
-      const aUnder = anchor(fu, useComps ? cufair : null, weight, maxDev);
-      return [
-        { label: label + " Over", ourFair: fo, ourPrice: toDecimal(fo, margin), compKey: compKey + "_over", compPrice: comps[compKey + "_over"], anchoredPrice: toDecimal(aOver, margin) },
-        { label: label + " Under", ourFair: fu, ourPrice: toDecimal(fu, margin), compKey: compKey + "_under", compPrice: comps[compKey + "_under"], anchoredPrice: toDecimal(aUnder, margin) },
-      ];
+      const [cofair, cufair] = useComps ? devig(num(prefix + "_over"), num(prefix + "_under")) : [null, null];
+      let aOver = toDecimal(anchor(fo, useComps ? cofair : null, weight, maxDev), margin);
+      let aUnder = toDecimal(anchor(fu, useComps ? cufair : null, weight, maxDev), margin);
+      let shownLine = line;
+      if (pregameActive) {                       // book passthrough
+        shownLine = fnum(book, bookLineKey, line);
+        aOver = fnum(book, bookOverKey) || aOver;
+        aUnder = fnum(book, bookUnderKey) || aUnder;
+      }
+      return { line: shownLine, rows: [
+        { label: `Over ${shownLine}`, ourFair: pregameActive ? null : fo, ourPrice: pregameActive ? "book" : toDecimal(fo, margin), compKey: prefix + "_over", compRaw: comps[prefix + "_over"] ?? "", anchoredPrice: aOver },
+        { label: `Under ${shownLine}`, ourFair: pregameActive ? null : fu, ourPrice: pregameActive ? "book" : toDecimal(fu, margin), compKey: prefix + "_under", compRaw: comps[prefix + "_under"] ?? "", anchoredPrice: aUnder },
+      ] };
     };
-    const msRow = (label, cdf, locked, kPlus, compKey) => {
+    const msRows = (cdf, locked, ladder, prefix) => ladder.map((kPlus) => {
       const p = pMilestone(cdf, locked, kPlus);
-      const cfair = useComps ? devig(comps[compKey], null)[0] : null;
+      const compKey = `${prefix}_m${kPlus}`;
+      const cfair = useComps ? devig(num(compKey), null)[0] : null;
       const a = anchor(p, cfair, weight, maxDev);
-      return { label, ourFair: p, ourPrice: toDecimal(p, margin), compKey, compPrice: comps[compKey] ?? null, anchoredPrice: toDecimal(a, margin) };
-    };
+      return { label: `${kPlus}+`, ourFair: p, ourPrice: toDecimal(p, margin), compKey, compRaw: comps[compKey] ?? "", anchoredPrice: toDecimal(a, margin) };
+    });
 
     if (kind === "hitter") {
-      const P = HITTERS[hitterName];
       const xpa = pregameXpaBySlot(slot - 1, battingHome, reachBase);
-      const rates = calibrateHitter(P.hits, P.tb, P.hr, xpa);
+      const rates = calibrateHitter(fnum(proj, "hits", 1), fnum(proj, "tb", 1), fnum(proj, "hr", 0.1), xpa);
+      // full-game (t=0) model variances for phi
+      const freshGS = { inning: 1, top: !battingHome, outs: 0, awayScore: 0, homeScore: 0, awayDueUp: 0, homeDueUp: 0 };
+      const [mNf, vNf] = hitterRemainingPA(freshGS, slot - 1, battingHome, reachBase, 0);
+      const phiH = phiFor(fnum(std, "hits"), compoundCount(mNf, vNf, rates.pHit)[1]);
+      const phiT = phiFor(fnum(std, "tb"), compoundTB(mNf, vNf, rates)[1]);
+      const phiR = phiFor(fnum(std, "hr"), compoundCount(mNf, vNf, rates.pHR)[1]);
+
       const [mN, vN] = hitterRemainingPA(gs, slot - 1, battingHome, reachBase, pullProb);
-      const [hm, hv] = compoundCount(mN, vN, rates.pHit);
+      let [hm, hv] = compoundCount(mN, vN, rates.pHit); hv *= phiH;
       const cdfH = countCdf(hm, hv);
-      const [tm, tv] = compoundTB(mN, vN, rates);
+      let [tm, tv] = compoundTB(mN, vN, rates); tv *= phiT;
       const cdfT = countCdf(tm, tv, 80);
-      const [rm, rv] = compoundCount(mN, vN, rates.pHR);
+      let [rm, rv] = compoundCount(mN, vN, rates.pHR); rv *= phiR;
       const cdfR = countCdf(rm, rv);
+
+      const hOU = ouMain(cdfH, lockHits, [0.5, 1.5, 2.5, 3.5], "hits_ou", "hits_line", "hits_over", "hits_under");
+      const tOU = ouMain(cdfT, lockTB, [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5], "tb_ou", "tb_line", "tb_over", "tb_under");
       return {
         xpa, xRPA: mN,
         cards: [
-          { title: "Hits", rows: [...ouRow("1.5", cdfH, lockHits, 1.5, "hits15"),
-            msRow("1+", cdfH, lockHits, 1, "hits1"), msRow("2+", cdfH, lockHits, 2, "hits2"), msRow("3+", cdfH, lockHits, 3, "hits3")] },
-          { title: "Total Bases", rows: [...ouRow("1.5", cdfT, lockTB, 1.5, "tb15"),
-            msRow("2+", cdfT, lockTB, 2, "tb2"), msRow("3+", cdfT, lockTB, 3, "tb3"), msRow("4+", cdfT, lockTB, 4, "tb4")] },
-          { title: "Home Runs", rows: [msRow("1+", cdfR, lockHR, 1, "hr1"), msRow("2+", cdfR, lockHR, 2, "hr2")] },
+          { title: "Hits", line: hOU.line, rows: [...hOU.rows, ...msRows(cdfH, lockHits, [1, 2, 3, 4], "hits")] },
+          { title: "Total Bases", line: tOU.line, rows: [...tOU.rows, ...msRows(cdfT, lockTB, [1, 2, 3, 4, 5, 6, 7, 8], "tb")] },
+          { title: "Home Runs", rows: msRows(cdfR, lockHR, [1, 2], "hr") },
         ],
       };
     } else {
-      const P = PITCHERS[pitcherName];
-      const bfPre = pregameBF(P.limit);
-      const rates = calibratePitcher(P.k, P.ha, bfPre);
-      const ps = { pitchesThrown: pitches, battersFaced: bf, tto, isStarter: true, hookPitchLimit: P.limit, scoreDiff: pScoreDiff };
+      const bfPre = pregameBF(hookLimit);
+      const rates = calibratePitcher(fnum(proj, "k", 1), fnum(proj, "ha", 1), bfPre);
+      const freshPS = { pitchesThrown: 0, battersFaced: 0, tto: 0, isStarter: true, hookPitchLimit: hookLimit, scoreDiff: 0 };
+      const [mBFf, vBFf] = pitcherRemainingBF(freshPS);
+      const phiK = phiFor(fnum(std, "k"), compoundCount(mBFf, vBFf, rates.pK)[1]);
+      const phiA = phiFor(fnum(std, "ha"), compoundCount(mBFf, vBFf, rates.pHit)[1]);
+
+      const ps = { pitchesThrown: pitches, battersFaced: bf, tto, isStarter: true, hookPitchLimit: hookLimit, scoreDiff: pScoreDiff };
       const [mBF, vBF] = pitcherRemainingBF(ps);
-      const [km, kv] = compoundCount(mBF, vBF, rates.pK);
+      let [km, kv] = compoundCount(mBF, vBF, rates.pK); kv *= phiK;
       const cdfK = countCdf(km, kv, 30);
-      const [am, av] = compoundCount(mBF, vBF, rates.pHit);
+      let [am, av] = compoundCount(mBF, vBF, rates.pHit); av *= phiA;
       const cdfA = countCdf(am, av, 30);
+
+      const kOU = ouMain(cdfK, lockK, [2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5], "k_ou", "k_line", "k_over", "k_under");
+      const aOU = ouMain(cdfA, lockHA, [2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5], "ha_ou", "ha_line", "ha_over", "ha_under");
       return {
         bfPre, xRemBF: mBF,
         cards: [
-          { title: "Strikeouts", rows: [...ouRow("6.5", cdfK, lockK, 6.5, "k65"),
-            msRow("4+", cdfK, lockK, 4, "k4"), msRow("6+", cdfK, lockK, 6, "k6"), msRow("8+", cdfK, lockK, 8, "k8")] },
-          { title: "Hits Allowed", rows: [...ouRow("5.5", cdfA, lockHA, 5.5, "ha55"),
-            msRow("4+", cdfA, lockHA, 4, "ha4"), msRow("6+", cdfA, lockHA, 6, "ha6")] },
+          { title: "Strikeouts", line: kOU.line, rows: [...kOU.rows, ...msRows(cdfK, lockK, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12], "k")] },
+          { title: "Hits Allowed", line: aOU.line, rows: [...aOU.rows, ...msRows(cdfA, lockHA, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "ha")] },
         ],
       };
     }
     // eslint-disable-next-line
-  }, [kind, hitterName, pitcherName, inning, top, outs, awayScore, homeScore, slot, dueUp,
+  }, [kind, proj, std, book, inning, top, outs, awayScore, homeScore, slot, dueUp,
       battingHome, lockHits, lockTB, lockHR, pitches, bf, tto, lockK, lockHA, pScoreDiff,
-      reachBase, pullProb, useComps, weight, maxDev, comps]);
-
-  const pregameActive = !firstEvent;
-  const P = kind === "hitter" ? HITTERS[hitterName] : PITCHERS[pitcherName];
+      reachBase, pullProb, pregameActive, useComps, weight, maxDev, comps]);
 
   return (
     <div style={{ background: C.bg, minHeight: "100vh", color: C.ink, fontFamily: "system-ui,-apple-system,sans-serif", padding: 18 }}>
@@ -412,23 +480,40 @@ export default function App() {
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
             <Toggle on={kind === "pitcher"} set={(v) => setKind(v ? "pitcher" : "hitter")} labels={["HITTER", "PITCHER"]} />
-            {kind === "hitter" ? (
-              <Field label="Player">
-                <select style={inputStyle} value={hitterName} onChange={(e) => setHitterName(e.target.value)}>
-                  {Object.keys(HITTERS).map((n) => <option key={n}>{n}</option>)}
-                </select>
-              </Field>
-            ) : (
-              <Field label="Player">
-                <select style={inputStyle} value={pitcherName} onChange={(e) => setPitcherName(e.target.value)}>
-                  {Object.keys(PITCHERS).map((n) => <option key={n}>{n}</option>)}
-                </select>
-              </Field>
-            )}
-            <div style={{ fontFamily: C.mono, fontSize: 10.5, color: C.faint, lineHeight: 1.6 }}>
-              {kind === "hitter"
-                ? `book proj — hits ${P.hits} · TB ${P.tb} · HR ${P.hr}`
-                : `book proj — K ${P.k} · hits allowed ${P.ha} · hook ${P.limit}p`}
+            <div style={{ fontFamily: C.mono, fontSize: 10, letterSpacing: 1, color: C.faint, textTransform: "uppercase" }}>Pre-match inputs</div>
+            {/* header */}
+            <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 0.9fr 0.9fr 0.9fr", gap: 6, alignItems: "end" }}>
+              {["Stat", "Proj", "StdDev", "Bk line", "Bk O", "Bk U"].map((h) => (
+                <span key={h} style={{ fontFamily: C.mono, fontSize: 8.5, letterSpacing: 0.4, color: C.faint, textTransform: "uppercase" }}>{h}</span>
+              ))}
+              {(kind === "hitter"
+                ? [["Hits", "hits", "hits_line", "hits_over", "hits_under"],
+                   ["Total bases", "tb", "tb_line", "tb_over", "tb_under"]]
+                : [["Strikeouts", "k", "k_line", "k_over", "k_under"],
+                   ["Hits allowed", "ha", "ha_line", "ha_over", "ha_under"]]
+              ).map(([label, sk, lk, ok, uk]) => (
+                <React.Fragment key={sk}>
+                  <span style={{ fontFamily: C.mono, fontSize: 11, color: C.dim, alignSelf: "center" }}>{label}</span>
+                  <MiniInput value={proj[sk]} onChange={(v) => setPr(sk, v)} />
+                  <MiniInput value={std[sk]} onChange={(v) => setSd(sk, v)} />
+                  <MiniInput value={book[lk]} onChange={(v) => setBk(lk, v)} />
+                  <MiniInput value={book[ok]} onChange={(v) => setBk(ok, v)} />
+                  <MiniInput value={book[uk]} onChange={(v) => setBk(uk, v)} />
+                </React.Fragment>
+              ))}
+              {kind === "hitter" && (
+                <React.Fragment>
+                  <span style={{ fontFamily: C.mono, fontSize: 11, color: C.dim, alignSelf: "center" }}>Home runs</span>
+                  <MiniInput value={proj.hr} onChange={(v) => setPr("hr", v)} />
+                  <MiniInput value={std.hr} onChange={(v) => setSd("hr", v)} />
+                  <span style={{ fontFamily: C.mono, fontSize: 9, color: C.faint, alignSelf: "center" }}>1+ px</span>
+                  <MiniInput value={book.hr1} onChange={(v) => setBk("hr1", v)} />
+                  <span />
+                </React.Fragment>
+              )}
+            </div>
+            <div style={{ fontFamily: C.mono, fontSize: 9.5, color: C.faint, lineHeight: 1.6 }}>
+              Proj = pre-match projection (mean). StdDev shapes the spread. Bk line/O/U are the book prices served until the first event.
             </div>
           </div>
 
@@ -537,6 +622,7 @@ export default function App() {
               <div key={i} style={{ gridColumn: card.title === "Home Runs" ? "span 2" : "span 1" }}>
                 <MarketCard
                   title={card.title}
+                  line={card.line}
                   suspended={suspended}
                   rows={card.rows.map((r, j) => (
                     <PriceRow key={j} row={r} suspended={suspended} setComp={setComp} />
