@@ -61,10 +61,12 @@ function teamRemainingPA(gs, battingHome, q = 0.32) {
   let varPA = (inningsLeft + curFrac) * paPerInnVar;
   if (battingHome && gs.inning >= 9 && gs.homeScore > gs.awayScore)
     meanPA = Math.max(0, meanPA - 0.5 * paPerInnMean);
-  if (gs.inning >= 8 && gs.awayScore === gs.homeScore) {
-    const pEx = 0.35;
-    meanPA += pEx * 2 * paPerInnMean;
-    varPA += pEx * (1 - pEx) * Math.pow(2 * paPerInnMean, 2);
+  // extra innings only matter once we're in/through the 9th and still tied —
+  // before that the 9th is already counted as a normal inning.
+  if (gs.inning >= 9 && gs.awayScore === gs.homeScore) {
+    const pEx = 0.33;
+    meanPA += pEx * paPerInnMean;
+    varPA += pEx * (1 - pEx) * Math.pow(paPerInnMean, 2);
   }
   return [meanPA, varPA];
 }
@@ -176,6 +178,41 @@ function anchor( our, comp, weight, maxDev) {
   return Math.max(comp - maxDev, Math.min(comp + maxDev, blended));
 }
 
+// ---------- derive the full-game mean (projection) from the book market ----------
+// The O/U line + de-vigged over price is the real read on expected performance.
+// Solve for the mean whose distribution (spread set by std dev) reproduces the
+// market's fair P(over line). Monotonic in mean -> bisection.
+function impliedMeanFromOU(line, over, under, std) {
+  const po = decToProb(over), pu = decToProb(under);
+  let fair;
+  if (po && pu) fair = po / (po + pu);          // two-way de-vig
+  else if (po) fair = po / 1.03;                // one-sided: shave ~half the hold
+  else return null;
+  fair = Math.min(0.995, Math.max(0.005, fair));
+  let lo = 0.001, hi = 30;
+  for (let i = 0; i < 46; i++) {
+    const mid = (lo + hi) / 2;
+    const v = std && std > 0 ? std * std : mid;
+    const p = pOver(countCdf(mid, v, 90), 0, line);
+    if (p < fair) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+// derive the mean from a 1+ (or n+) milestone price, e.g. home runs
+function impliedMeanFrom1Plus(price, std) {
+  const pr = decToProb(price);
+  if (!pr) return null;
+  const fair = Math.min(0.97, Math.max(0.003, pr / 1.03));
+  let lo = 0.001, hi = 6;
+  for (let i = 0; i < 42; i++) {
+    const mid = (lo + hi) / 2;
+    const v = std && std > 0 ? std * std : mid;
+    const p1 = 1 - countCdf(mid, v, 40)[0];
+    if (p1 < fair) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
 // ============================================================================
 //  UI
 // ============================================================================
@@ -259,13 +296,14 @@ function PriceRow({ row, suspended, setComp }) {
   );
 }
 
-function MarketCard({ title, line, rows, suspended, note }) {
+function MarketCard({ title, proj, line, rows, suspended, note }) {
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
         padding: "10px 12px", borderBottom: `1px solid ${C.line}`, background: C.panel2 }}>
         <span style={{ fontFamily: C.mono, fontSize: 12, letterSpacing: 0.5, color: C.ink, textTransform: "uppercase" }}>
           {title}
+          {proj != null && <span style={{ color: C.dim, marginLeft: 8, textTransform: "none" }}>proj {proj.toFixed(2)}</span>}
           {line != null && <span style={{ color: C.accent, marginLeft: 8 }}>O/U {line}</span>}
         </span>
         {suspended && <span style={{ fontFamily: C.mono, fontSize: 10, color: C.warn, border: `1px solid ${C.warn}`, padding: "2px 6px", borderRadius: 4 }}>SUSPENDED</span>}
@@ -287,19 +325,21 @@ export default function App() {
   // projections (means) and std devs are RAW STRINGS so decimals type freely
   const [proj, setProj] = useState({ hits: "1.5", tb: "2.2", hr: "0.2", k: "6.14", ha: "5.5" });
   const [std, setStd]   = useState({ hits: "0.9", tb: "1.67", hr: "0.5", k: "2.4", ha: "2.0" });
-  // pre-game book O/U line + prices (served verbatim until first event)
+  // pre-game book O/U line + prices — the REAL read on expected performance.
+  // the engine derives each stat's mean by inverting these (see impliedMean*).
   const [book, setBook] = useState({
-    hits_line: "1.5", hits_over: "1.43", hits_under: "2.74",
-    tb_line: "1.5", tb_over: "1.95", tb_under: "1.80",
+    hits_line: "0.5", hits_over: "1.43", hits_under: "2.74",
+    tb_line: "1.5", tb_over: "1.92", tb_under: "1.82",
     hr1: "5.00",
-    k_line: "6.5", k_over: "", k_under: "",
-    ha_line: "5.5", ha_over: "", ha_under: "",
+    k_line: "5.5", k_over: "1.80", k_under: "2.00",
+    ha_line: "5.5", ha_over: "1.90", ha_under: "1.90",
   });
   const hookLimit = 95;
   const setPr = (k, v) => { if (v === "" || /^\d*\.?\d*$/.test(v)) setProj((p) => ({ ...p, [k]: v })); };
   const setSd = (k, v) => { if (v === "" || /^\d*\.?\d*$/.test(v)) setStd((p) => ({ ...p, [k]: v })); };
   const setBk = (k, v) => { if (v === "" || /^\d*\.?\d*$/.test(v)) setBook((p) => ({ ...p, [k]: v })); };
   const fnum = (obj, k, def = 0) => { const v = parseFloat(obj[k]); return isNaN(v) ? def : v; };
+  const bnum = (k) => { const v = parseFloat(book[k]); return isNaN(v) ? null : v; };
 
   // game state
   const [inning, setInning] = useState(6);
@@ -359,12 +399,13 @@ export default function App() {
 
   const result = useMemo(() => {
     // overdispersion factor phi so the model's full-game variance matches the
-    // std dev you entered. computed at t=0 (fresh game) and applied to the live
-    // remaining variance, so your std dev genuinely shapes the distribution.
+    // std dev you entered. IMPORTANT: std dev can only WIDEN the distribution
+    // (phi >= 1), never tighten it below the natural sampling variance — a hit
+    // count built from per-PA coin flips has a hard variance floor.
     const phiFor = (userStd, modelFullVar) => {
       if (!userStd || userStd <= 0) return 1;
       const f = (userStd * userStd) / Math.max(modelFullVar, 1e-6);
-      return Math.min(8, Math.max(0.3, f));
+      return Math.min(4, Math.max(1.0, f));
     };
     // choose the O/U line from a ladder so the price stays near even money.
     const pickBalancedLine = (cdf, locked, ladder) => {
@@ -405,7 +446,11 @@ export default function App() {
 
     if (kind === "hitter") {
       const xpa = pregameXpaBySlot(slot - 1, battingHome, reachBase);
-      const rates = calibrateHitter(fnum(proj, "hits", 1), fnum(proj, "tb", 1), fnum(proj, "hr", 0.1), xpa);
+      // MEANS come from the market: invert book O/U line+price (HR from 1+ price)
+      const hitsMean = impliedMeanFromOU(fnum(book, "hits_line", 0.5), bnum("hits_over"), bnum("hits_under"), fnum(std, "hits")) ?? fnum(proj, "hits", 1);
+      const tbMean = impliedMeanFromOU(fnum(book, "tb_line", 1.5), bnum("tb_over"), bnum("tb_under"), fnum(std, "tb")) ?? fnum(proj, "tb", 1);
+      const hrMean = impliedMeanFrom1Plus(bnum("hr1"), fnum(std, "hr")) ?? fnum(proj, "hr", 0.1);
+      const rates = calibrateHitter(hitsMean, tbMean, hrMean, xpa);
       // full-game (t=0) model variances for phi
       const freshGS = { inning: 1, top: !battingHome, outs: 0, awayScore: 0, homeScore: 0, awayDueUp: 0, homeDueUp: 0 };
       const [mNf, vNf] = hitterRemainingPA(freshGS, slot - 1, battingHome, reachBase, 0);
@@ -426,14 +471,16 @@ export default function App() {
       return {
         xpa, xRPA: mN,
         cards: [
-          { title: "Hits", line: hOU.line, rows: [...hOU.rows, ...msRows(cdfH, lockHits, [1, 2, 3, 4], "hits")] },
-          { title: "Total Bases", line: tOU.line, rows: [...tOU.rows, ...msRows(cdfT, lockTB, [1, 2, 3, 4, 5, 6, 7, 8], "tb")] },
-          { title: "Home Runs", rows: msRows(cdfR, lockHR, [1, 2], "hr") },
+          { title: "Hits", proj: hitsMean, line: hOU.line, rows: [...hOU.rows, ...msRows(cdfH, lockHits, [1, 2, 3, 4], "hits")] },
+          { title: "Total Bases", proj: tbMean, line: tOU.line, rows: [...tOU.rows, ...msRows(cdfT, lockTB, [1, 2, 3, 4, 5, 6, 7, 8], "tb")] },
+          { title: "Home Runs", proj: hrMean, rows: msRows(cdfR, lockHR, [1, 2], "hr") },
         ],
       };
     } else {
       const bfPre = pregameBF(hookLimit);
-      const rates = calibratePitcher(fnum(proj, "k", 1), fnum(proj, "ha", 1), bfPre);
+      const kMean = impliedMeanFromOU(fnum(book, "k_line", 5.5), bnum("k_over"), bnum("k_under"), fnum(std, "k")) ?? fnum(proj, "k", 1);
+      const haMean = impliedMeanFromOU(fnum(book, "ha_line", 5.5), bnum("ha_over"), bnum("ha_under"), fnum(std, "ha")) ?? fnum(proj, "ha", 1);
+      const rates = calibratePitcher(kMean, haMean, bfPre);
       const freshPS = { pitchesThrown: 0, battersFaced: 0, tto: 0, isStarter: true, hookPitchLimit: hookLimit, scoreDiff: 0 };
       const [mBFf, vBFf] = pitcherRemainingBF(freshPS);
       const phiK = phiFor(fnum(std, "k"), compoundCount(mBFf, vBFf, rates.pK)[1]);
@@ -451,8 +498,8 @@ export default function App() {
       return {
         bfPre, xRemBF: mBF,
         cards: [
-          { title: "Strikeouts", line: kOU.line, rows: [...kOU.rows, ...msRows(cdfK, lockK, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12], "k")] },
-          { title: "Hits Allowed", line: aOU.line, rows: [...aOU.rows, ...msRows(cdfA, lockHA, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "ha")] },
+          { title: "Strikeouts", proj: kMean, line: kOU.line, rows: [...kOU.rows, ...msRows(cdfK, lockK, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12], "k")] },
+          { title: "Hits Allowed", proj: haMean, line: aOU.line, rows: [...aOU.rows, ...msRows(cdfA, lockHA, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "ha")] },
         ],
       };
     }
@@ -483,7 +530,7 @@ export default function App() {
             <div style={{ fontFamily: C.mono, fontSize: 10, letterSpacing: 1, color: C.faint, textTransform: "uppercase" }}>Pre-match inputs</div>
             {/* header */}
             <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 0.9fr 0.9fr 0.9fr", gap: 6, alignItems: "end" }}>
-              {["Stat", "Proj", "StdDev", "Bk line", "Bk O", "Bk U"].map((h) => (
+              {["Stat", "Proj·ref", "StdDev", "Bk line", "Bk O", "Bk U"].map((h) => (
                 <span key={h} style={{ fontFamily: C.mono, fontSize: 8.5, letterSpacing: 0.4, color: C.faint, textTransform: "uppercase" }}>{h}</span>
               ))}
               {(kind === "hitter"
@@ -513,7 +560,7 @@ export default function App() {
               )}
             </div>
             <div style={{ fontFamily: C.mono, fontSize: 9.5, color: C.faint, lineHeight: 1.6 }}>
-              Proj = pre-match projection (mean). StdDev shapes the spread. Bk line/O/U are the book prices served until the first event.
+              Engine derives each stat's expected value from the book O/U <b>line + price</b> (HR from the 1+ price). <b>Proj</b> is your internal reference only — not used for pricing. StdDev shapes the spread. See each market header for the derived projection.
             </div>
           </div>
 
@@ -622,6 +669,7 @@ export default function App() {
               <div key={i} style={{ gridColumn: card.title === "Home Runs" ? "span 2" : "span 1" }}>
                 <MarketCard
                   title={card.title}
+                  proj={card.proj}
                   line={card.line}
                   suspended={suspended}
                   rows={card.rows.map((r, j) => (
